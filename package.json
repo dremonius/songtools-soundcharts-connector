@@ -1,0 +1,19 @@
+{
+  "name": "songtools-soundcharts-connector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only MCP connector for batch Soundcharts enrichment of Songtools artists.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs && node --check src/soundcharts.mjs && node --check src/enrichment.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "express": "^5.1.0",
+    "zod": "^4.0.0"
+  }
+}

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: songtools-soundcharts-connector
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: SOUNDCHARTS_CLIENT_ID
+        sync: false
+      - key: SOUNDCHARTS_CLIENT_SECRET
+        sync: false
+      - key: SOUNDCHARTS_TEAM_ID
+        sync: false
+      - key: MCP_BEARER_TOKEN
+        generateValue: true
+      - key: SOUNDCHARTS_CONCURRENCY
+        value: "20"
