@@ -108,6 +108,44 @@ export class ArtistDatabase {
           completed_at TIMESTAMPTZ
         )
       `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS bulk_jobs (
+          id BIGSERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          source_key TEXT UNIQUE,
+          status TEXT NOT NULL DEFAULT 'paused',
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          started_at TIMESTAMPTZ,
+          completed_at TIMESTAMPTZ,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          last_error TEXT
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS bulk_job_items (
+          id BIGSERIAL PRIMARY KEY,
+          job_id BIGINT NOT NULL REFERENCES bulk_jobs(id) ON DELETE CASCADE,
+          ordinal INTEGER NOT NULL,
+          artist_name TEXT NOT NULL,
+          spotify_track_id TEXT,
+          first_songtools_date DATE,
+          readiness TEXT,
+          track_source TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          result_status TEXT,
+          result JSONB,
+          error TEXT,
+          claimed_at TIMESTAMPTZ,
+          completed_at TIMESTAMPTZ,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (job_id, ordinal)
+        )
+      `);
+      await client.query("CREATE INDEX IF NOT EXISTS idx_bulk_jobs_status ON bulk_jobs(status, created_at)");
+      await client.query("CREATE INDEX IF NOT EXISTS idx_bulk_job_items_claim ON bulk_job_items(job_id, status, ordinal)");
+      await client.query("CREATE INDEX IF NOT EXISTS idx_bulk_job_items_status ON bulk_job_items(job_id, status)");
       await client.query("CREATE INDEX IF NOT EXISTS idx_soundcharts_artists_first_date ON soundcharts_artists(first_songtools_date)");
       await client.query("CREATE INDEX IF NOT EXISTS idx_track_resolutions_artist_id ON track_resolutions(soundcharts_artist_id)");
       await client.query("CREATE INDEX IF NOT EXISTS idx_listener_observations_artist_date ON listener_observations(soundcharts_artist_id, observation_date DESC)");
@@ -132,7 +170,9 @@ export class ArtistDatabase {
         (SELECT COUNT(*)::bigint FROM soundcharts_artists) AS artists,
         (SELECT COUNT(*)::bigint FROM track_resolutions) AS track_resolutions,
         (SELECT COUNT(*)::bigint FROM listener_observations) AS listener_observations,
-        (SELECT COUNT(*)::bigint FROM enrichment_runs) AS enrichment_runs
+        (SELECT COUNT(*)::bigint FROM enrichment_runs) AS enrichment_runs,
+        (SELECT COUNT(*)::bigint FROM bulk_jobs) AS bulk_jobs,
+        (SELECT COUNT(*)::bigint FROM bulk_job_items) AS bulk_job_items
     `);
     const row = result.rows[0] || {};
     return {
@@ -140,7 +180,9 @@ export class ArtistDatabase {
       artists: Number(row.artists || 0),
       trackResolutions: Number(row.track_resolutions || 0),
       listenerObservations: Number(row.listener_observations || 0),
-      enrichmentRuns: Number(row.enrichment_runs || 0)
+      enrichmentRuns: Number(row.enrichment_runs || 0),
+      bulkJobs: Number(row.bulk_jobs || 0),
+      bulkJobItems: Number(row.bulk_job_items || 0)
     };
   }
 
@@ -396,6 +438,325 @@ export class ArtistDatabase {
       stats.failures || 0,
       JSON.stringify(metadata || {})
     ]);
+  }
+
+  async createBulkJob({ name, sourceKey = null, items = [], metadata = {} }) {
+    if (!Array.isArray(items) || !items.length) throw new Error("Bulk job requires at least one item");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      let jobResult = await client.query(`
+        INSERT INTO bulk_jobs (name, source_key, status, metadata)
+        VALUES ($1,$2,'paused',$3::jsonb)
+        ON CONFLICT (source_key) DO NOTHING
+        RETURNING id, name, source_key, status, created_at
+      `, [name || "Songtools artist enrichment", sourceKey, JSON.stringify(metadata || {})]);
+
+      if (!jobResult.rows.length && sourceKey) {
+        jobResult = await client.query(`
+          SELECT id, name, source_key, status, created_at
+          FROM bulk_jobs WHERE source_key = $1 LIMIT 1
+        `, [sourceKey]);
+        await client.query("COMMIT");
+        const existing = jobResult.rows[0];
+        return { created: false, jobId: Number(existing.id), name: existing.name, status: existing.status, sourceKey: existing.source_key };
+      }
+
+      const job = jobResult.rows[0];
+      const normalized = items.map((item, index) => ({
+        ordinal: Number.isFinite(Number(item.ordinal)) ? Number(item.ordinal) : index + 1,
+        artist_name: String(item.artistName || "").trim(),
+        spotify_track_id: item.spotifyTrackId ? String(item.spotifyTrackId).trim() : null,
+        first_songtools_date: item.firstSongtoolsDate ? String(item.firstSongtoolsDate).slice(0, 10) : null,
+        readiness: item.readiness ? String(item.readiness) : null,
+        track_source: item.trackSource ? String(item.trackSource) : null
+      })).filter((item) => item.artist_name);
+
+      await client.query(`
+        INSERT INTO bulk_job_items (
+          job_id, ordinal, artist_name, spotify_track_id, first_songtools_date,
+          readiness, track_source, status
+        )
+        SELECT $1, x.ordinal, x.artist_name, NULLIF(x.spotify_track_id,''),
+               NULLIF(x.first_songtools_date,'')::date,
+               x.readiness, x.track_source, 'pending'
+        FROM jsonb_to_recordset($2::jsonb) AS x(
+          ordinal INTEGER,
+          artist_name TEXT,
+          spotify_track_id TEXT,
+          first_songtools_date TEXT,
+          readiness TEXT,
+          track_source TEXT
+        )
+        ON CONFLICT (job_id, ordinal) DO NOTHING
+      `, [job.id, JSON.stringify(normalized)]);
+
+      await client.query("COMMIT");
+      return {
+        created: true,
+        jobId: Number(job.id),
+        name: job.name,
+        status: job.status,
+        sourceKey: job.source_key,
+        totalItems: normalized.length
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listBulkJobs(limit = 20) {
+    const safeLimit = Math.max(1, Math.min(100, Number(limit) || 20));
+    const result = await this.pool.query(`
+      SELECT j.*,
+             COUNT(i.id)::bigint AS total_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'pending')::bigint AS pending_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'processing')::bigint AS processing_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'completed')::bigint AS completed_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'partial')::bigint AS partial_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'failed')::bigint AS failed_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'skipped')::bigint AS skipped_items
+      FROM bulk_jobs j
+      LEFT JOIN bulk_job_items i ON i.job_id = j.id
+      GROUP BY j.id
+      ORDER BY j.created_at DESC
+      LIMIT $1
+    `, [safeLimit]);
+    return result.rows.map((row) => this._bulkJobSummary(row));
+  }
+
+  _bulkJobSummary(row) {
+    if (!row) return null;
+    const total = Number(row.total_items || 0);
+    const completed = Number(row.completed_items || 0);
+    const partial = Number(row.partial_items || 0);
+    const failed = Number(row.failed_items || 0);
+    const skipped = Number(row.skipped_items || 0);
+    const finished = completed + partial + failed + skipped;
+    return {
+      jobId: Number(row.id),
+      name: row.name,
+      sourceKey: row.source_key ?? null,
+      status: row.status,
+      totalItems: total,
+      pending: Number(row.pending_items || 0),
+      processing: Number(row.processing_items || 0),
+      completed,
+      partial,
+      failed,
+      skipped,
+      finished,
+      percentFinished: total ? Number(((finished / total) * 100).toFixed(2)) : 0,
+      createdAt: row.created_at ?? null,
+      startedAt: row.started_at ?? null,
+      completedAt: row.completed_at ?? null,
+      updatedAt: row.updated_at ?? null,
+      lastError: row.last_error ?? null,
+      metadata: row.metadata ?? {}
+    };
+  }
+
+  async bulkJobStatus(jobId = null) {
+    const selector = jobId
+      ? { clause: "WHERE j.id = $1", params: [jobId] }
+      : { clause: "", params: [] };
+    const result = await this.pool.query(`
+      SELECT j.*,
+             COUNT(i.id)::bigint AS total_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'pending')::bigint AS pending_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'processing')::bigint AS processing_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'completed')::bigint AS completed_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'partial')::bigint AS partial_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'failed')::bigint AS failed_items,
+             COUNT(i.id) FILTER (WHERE i.status = 'skipped')::bigint AS skipped_items
+      FROM bulk_jobs j
+      LEFT JOIN bulk_job_items i ON i.job_id = j.id
+      ${selector.clause}
+      GROUP BY j.id
+      ORDER BY j.created_at DESC
+      LIMIT 1
+    `, selector.params);
+    if (!result.rows.length) return null;
+    const summary = this._bulkJobSummary(result.rows[0]);
+    const readinessResult = await this.pool.query(`
+      SELECT COALESCE(readiness,'unknown') AS readiness, COUNT(*)::bigint AS count
+      FROM bulk_job_items WHERE job_id = $1 GROUP BY COALESCE(readiness,'unknown') ORDER BY count DESC
+    `, [summary.jobId]);
+    summary.readiness = Object.fromEntries(readinessResult.rows.map((r) => [r.readiness, Number(r.count)]));
+    return summary;
+  }
+
+  async setBulkJobStatus(jobId, status) {
+    const allowed = new Set(['paused','queued','running','completed','cancelled']);
+    if (!allowed.has(status)) throw new Error(`Invalid bulk job status: ${status}`);
+    const result = await this.pool.query(`
+      UPDATE bulk_jobs SET
+        status = $2,
+        started_at = CASE WHEN $2 IN ('queued','running') THEN COALESCE(started_at,NOW()) ELSE started_at END,
+        completed_at = CASE WHEN $2 IN ('completed','cancelled') THEN NOW() ELSE NULL END,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING id
+    `, [jobId, status]);
+    if (!result.rows.length) throw new Error(`Bulk job ${jobId} not found`);
+    return this.bulkJobStatus(jobId);
+  }
+
+  async getRunnableBulkJob() {
+    const result = await this.pool.query(`
+      SELECT j.id
+      FROM bulk_jobs j
+      WHERE j.status IN ('queued','running')
+        AND EXISTS (
+          SELECT 1 FROM bulk_job_items i
+          WHERE i.job_id = j.id AND i.status = 'pending'
+        )
+      ORDER BY j.created_at ASC
+      LIMIT 1
+    `);
+    return result.rows[0] ? Number(result.rows[0].id) : null;
+  }
+
+  async claimBulkBatch(jobId, limit = 50, maxAttempts = 3, staleMinutes = 15) {
+    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
+    const safeAttempts = Math.max(1, Math.min(20, Number(maxAttempts) || 3));
+    const safeStale = Math.max(1, Math.min(1440, Number(staleMinutes) || 15));
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`
+        UPDATE bulk_job_items SET
+          status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END,
+          error = CASE WHEN attempts >= $2 THEN COALESCE(error,'Worker lease expired after maximum attempts') ELSE error END,
+          claimed_at = NULL,
+          updated_at = NOW()
+        WHERE job_id = $1
+          AND status = 'processing'
+          AND claimed_at < NOW() - ($3::text || ' minutes')::interval
+      `, [jobId, safeAttempts, safeStale]);
+
+      const selected = await client.query(`
+        SELECT id
+        FROM bulk_job_items
+        WHERE job_id = $1 AND status = 'pending' AND attempts < $3
+        ORDER BY ordinal ASC
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+      `, [jobId, safeLimit, safeAttempts]);
+      const ids = selected.rows.map((r) => r.id);
+      if (!ids.length) {
+        await client.query("COMMIT");
+        return [];
+      }
+      const claimed = await client.query(`
+        UPDATE bulk_job_items SET
+          status = 'processing', attempts = attempts + 1, claimed_at = NOW(), updated_at = NOW()
+        WHERE id = ANY($1::bigint[])
+        RETURNING id, job_id, ordinal, artist_name, spotify_track_id, first_songtools_date,
+                  readiness, track_source, status, attempts
+      `, [ids]);
+      await client.query(`
+        UPDATE bulk_jobs SET status = 'running', started_at = COALESCE(started_at,NOW()), updated_at = NOW()
+        WHERE id = $1 AND status = 'queued'
+      `, [jobId]);
+      await client.query("COMMIT");
+      return claimed.rows.sort((a,b) => a.ordinal - b.ordinal);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async finishBulkItem(itemId, status, { result = null, resultStatus = null, error = null } = {}) {
+    const allowed = new Set(['completed','partial','failed','skipped','pending']);
+    if (!allowed.has(status)) throw new Error(`Invalid bulk item status: ${status}`);
+    await this.pool.query(`
+      UPDATE bulk_job_items SET
+        status = $2,
+        result_status = $3,
+        result = $4::jsonb,
+        error = $5,
+        claimed_at = CASE WHEN $2 = 'processing' THEN claimed_at ELSE NULL END,
+        completed_at = CASE WHEN $2 IN ('completed','partial','failed','skipped') THEN NOW() ELSE NULL END,
+        updated_at = NOW()
+      WHERE id = $1
+    `, [itemId, status, resultStatus, result ? JSON.stringify(result) : null, error]);
+  }
+
+  async completeBulkJobIfDone(jobId) {
+    const result = await this.pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status IN ('pending','processing'))::bigint AS open_items,
+        COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed_items
+      FROM bulk_job_items WHERE job_id = $1
+    `, [jobId]);
+    const open = Number(result.rows[0]?.open_items || 0);
+    if (open > 0) return false;
+    await this.pool.query(`
+      UPDATE bulk_jobs SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+      WHERE id = $1 AND status IN ('queued','running','paused')
+    `, [jobId]);
+    return true;
+  }
+
+  async setBulkJobError(jobId, error) {
+    await this.pool.query(`
+      UPDATE bulk_jobs SET last_error = $2, updated_at = NOW() WHERE id = $1
+    `, [jobId, String(error || '').slice(0, 4000)]);
+  }
+
+  async getBulkJobFailures(jobId, limit = 50) {
+    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+    const result = await this.pool.query(`
+      SELECT ordinal, artist_name, spotify_track_id, first_songtools_date,
+             readiness, attempts, result_status, error, result
+      FROM bulk_job_items
+      WHERE job_id = $1 AND status = 'failed'
+      ORDER BY ordinal ASC
+      LIMIT $2
+    `, [jobId, safeLimit]);
+    return result.rows.map((r) => ({
+      ordinal: r.ordinal,
+      artistName: r.artist_name,
+      spotifyTrackId: r.spotify_track_id,
+      firstSongtoolsDate: r.first_songtools_date ? String(r.first_songtools_date).slice(0,10) : null,
+      readiness: r.readiness,
+      attempts: r.attempts,
+      resultStatus: r.result_status,
+      error: r.error,
+      result: r.result
+    }));
+  }
+
+  async exportBulkJob(jobId) {
+    const job = await this.bulkJobStatus(jobId);
+    if (!job) return null;
+    const result = await this.pool.query(`
+      SELECT ordinal, artist_name, spotify_track_id, first_songtools_date,
+             readiness, track_source, status, attempts, result_status, result, error
+      FROM bulk_job_items WHERE job_id = $1 ORDER BY ordinal ASC
+    `, [jobId]);
+    return {
+      job,
+      items: result.rows.map((r) => ({
+        ordinal: r.ordinal,
+        artistName: r.artist_name,
+        spotifyTrackId: r.spotify_track_id,
+        firstSongtoolsDate: r.first_songtools_date ? String(r.first_songtools_date).slice(0,10) : null,
+        readiness: r.readiness,
+        trackSource: r.track_source,
+        status: r.status,
+        attempts: r.attempts,
+        resultStatus: r.result_status,
+        result: r.result,
+        error: r.error
+      }))
+    };
   }
 
   async close() {
