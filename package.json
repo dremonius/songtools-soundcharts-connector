@@ -1,15 +1,15 @@
 {
   "name": "songtools-soundcharts-connector",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Read-only MCP connector for batch Soundcharts enrichment of Songtools artists with persistent PostgreSQL caching.",
+  "description": "MCP connector for persistent Soundcharts enrichment with PostgreSQL caching and resumable bulk jobs.",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "check": "node --check src/server.mjs && node --check src/soundcharts.mjs && node --check src/enrichment.mjs && node --check src/database.mjs && node --check src/cached-enrichment.mjs"
+    "check": "node --check src/server.mjs && node --check src/soundcharts.mjs && node --check src/enrichment.mjs && node --check src/database.mjs && node --check src/cached-enrichment.mjs && node --check src/bulk-worker.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
