@@ -117,7 +117,7 @@ function getServer() {
   return server;
 }
 
-const app = createMcpExpressApp();
+const app = createMcpExpressApp({ host: "0.0.0.0" });
 app.use((req, res, next) => {
   if (req.path !== MCP_PATH || !MCP_BEARER_TOKEN) return next();
   const auth = req.headers.authorization || "";
@@ -169,7 +169,7 @@ app.delete(MCP_PATH, (_req, res) => {
   });
 });
 
-app.listen(PORT, (error) => {
+app.listen(PORT, "0.0.0.0", (error) => {
   if (error) {
     console.error("Failed to start server", error);
     process.exit(1);
