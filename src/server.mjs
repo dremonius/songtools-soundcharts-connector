@@ -53,7 +53,7 @@ function jsonResult(value) {
 function getServer() {
   const server = new McpServer({
     name: "songtools-soundcharts",
-    version: "0.3.0"
+    version: "0.3.1"
   });
 
   server.registerTool(
@@ -146,6 +146,22 @@ function getServer() {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
     },
     async ({ jobId, limit }) => jsonResult({ failures: await persistenceDatabase().getBulkJobFailures(jobId, limit || 50) })
+  );
+
+  server.registerTool(
+    "bulk_job_requeue_quota_failures",
+    {
+      title: "Requeue quota-exhaustion failures",
+      description: "Find failed bulk-job items caused specifically by Soundcharts monthly quota exhaustion and optionally reset only those rows to pending. Dry-run is the default. No Soundcharts API calls are made by this tool.",
+      inputSchema: {
+        jobId: z.number().int().positive(),
+        dryRun: z.boolean().optional()
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
+    },
+    async ({ jobId, dryRun }) => jsonResult(await persistenceDatabase().requeueBulkQuotaFailures(jobId, {
+      dryRun: dryRun !== false
+    }))
   );
 
   server.registerTool(
@@ -271,7 +287,7 @@ app.get("/health", async (_req, res) => {
   res.status(ok ? 200 : 503).json({
     ok,
     service: "songtools-soundcharts",
-    version: "0.3.0",
+    version: "0.3.1",
     mcpPath: MCP_PATH,
     bulkImportPath: BULK_IMPORT_PATH,
     database: databaseHealth,

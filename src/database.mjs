@@ -733,6 +733,85 @@ export class ArtistDatabase {
     }));
   }
 
+  async requeueBulkQuotaFailures(jobId, { dryRun = true } = {}) {
+    const job = await this.bulkJobStatus(jobId);
+    if (!job) throw new Error(`Bulk job ${jobId} not found`);
+
+    // Match only explicit monthly quota-exhaustion failures. This intentionally
+    // excludes generic 429/rate-limit errors, 404s, and artist-resolution failures.
+    const quotaPredicate = `
+      status = 'failed'
+      AND (
+        COALESCE(error, '') ILIKE '%monthly available quota%'
+        OR COALESCE(result::text, '') ILIKE '%monthly available quota%'
+      )
+    `;
+
+    const countResult = await this.pool.query(`
+      SELECT COUNT(*)::bigint AS matched
+      FROM bulk_job_items
+      WHERE job_id = $1 AND ${quotaPredicate}
+    `, [jobId]);
+    const matched = Number(countResult.rows[0]?.matched || 0);
+    const untouchedFailures = Math.max(0, Number(job.failed || 0) - matched);
+
+    if (dryRun || matched === 0) {
+      return {
+        jobId: Number(jobId),
+        dryRun: Boolean(dryRun),
+        matchedQuotaFailures: matched,
+        requeued: 0,
+        untouchedFailures,
+        job
+      };
+    }
+
+    if (!['completed', 'paused'].includes(job.status)) {
+      throw new Error(`Bulk job ${jobId} must be completed or paused before quota failures can be requeued; current status is ${job.status}`);
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const updateResult = await client.query(`
+        UPDATE bulk_job_items SET
+          status = 'pending',
+          attempts = 0,
+          result_status = 'requeued_quota',
+          claimed_at = NULL,
+          completed_at = NULL,
+          updated_at = NOW()
+        WHERE job_id = $1 AND ${quotaPredicate}
+      `, [jobId]);
+
+      // Reopened jobs are left paused on purpose. The caller can inspect the
+      // counts, then explicitly start the job with bulk_job_start.
+      await client.query(`
+        UPDATE bulk_jobs SET
+          status = 'paused',
+          completed_at = NULL,
+          updated_at = NOW()
+        WHERE id = $1
+      `, [jobId]);
+      await client.query('COMMIT');
+
+      const refreshedJob = await this.bulkJobStatus(jobId);
+      return {
+        jobId: Number(jobId),
+        dryRun: false,
+        matchedQuotaFailures: matched,
+        requeued: Number(updateResult.rowCount || 0),
+        untouchedFailures,
+        job: refreshedJob
+      };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async exportBulkJob(jobId) {
     const job = await this.bulkJobStatus(jobId);
     if (!job) return null;
