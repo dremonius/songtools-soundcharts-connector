@@ -1,6 +1,6 @@
 {
   "name": "songtools-soundcharts-connector",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "MCP connector for persistent Soundcharts enrichment with PostgreSQL caching and resumable bulk jobs.",
